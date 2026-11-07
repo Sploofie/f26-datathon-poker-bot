@@ -1,0 +1,63 @@
+# =============================================================================
+# Dockerfile.agent - builds ONE participant's bot on top of the base image.
+#
+# The build context (the "." at the end of docker build) is the root of the
+# participant's repo: agent.py, requirements.txt, and any files they added.
+# Their .dockerignore decides which files are left out of the image.
+#
+# Organizers (build_agent.sh) pass the real base image, pinned by digest:
+#     docker build -f Dockerfile.agent --build-arg BASE_IMAGE=<registry>/agent-base@sha256:... .
+# Participants (tools/check_build.sh) use their local copy of the base:
+#     docker build -f docker/Dockerfile.agent .        # BASE_IMAGE defaults below
+# =============================================================================
+
+ARG BASE_IMAGE=poker-agent-base:local
+FROM ${BASE_IMAGE}
+
+# Installing packages needs root (user 0). We switch back to "bot" (10001) at the end.
+USER 0
+WORKDIR /app
+
+# --- 1. Install the bot's dependencies ----------------------------------------
+# requirements.txt is copied on its own first, so Docker can reuse this
+# (slow) step when only the bot's code changes.
+COPY requirements.txt /app/requirements.txt
+
+# How the install works:
+#   -c /opt/poker/constraints.txt
+#       Keeps FastAPI, uvicorn and their helpers at the base image's versions,
+#       so the server plumbing always works. Asking for other versions of
+#       them makes the build fail with a "conflict" message.
+#   --extra-index-url https://download.pytorch.org/whl/cpu
+#       If the bot needs a different PyTorch version than the one in the
+#       base, pip picks PyTorch's CPU-only edition instead of the much larger
+#       GPU edition.
+#   --mount=type=cache,...
+#       A download cache that stays on the BUILD machine between builds (it is
+#       never part of the image), so a package used by many teams is
+#       downloaded once instead of once per team.
+RUN --mount=type=cache,target=/var/cache/pip \
+    PIP_CACHE_DIR=/var/cache/pip pip install \
+        -c /opt/poker/constraints.txt \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements.txt
+
+# --- 2. Copy the bot's code ----------------------------------------------------
+COPY . /app
+
+# --- 3. Lock things down -------------------------------------------------------
+# * Files are owned by root and readable (not writable) by everyone, so the
+#   running bot can't change its own code. At match time only /tmp is writable.
+# * Strip setuid/setgid bits again, in case a pip package added any.
+# * Fail early (with a clear message) if agent.py is missing from the image,
+#   e.g. because .dockerignore excluded it.
+RUN chown -R root:root /app \
+ && chmod -R a+rX,go-w /app \
+ && find /app /usr/local -xdev -type f -perm /6000 -exec chmod a-s {} +
+RUN if [ ! -f /app/agent.py ]; then \
+        echo "agent.py is missing from the image (check your .dockerignore)" >&2; exit 1; \
+    fi
+
+# --- 4. Run as the unprivileged "bot" user --------------------------------------
+USER 10001:10001
+CMD ["python", "agent.py"]

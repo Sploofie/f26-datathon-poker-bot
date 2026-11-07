@@ -1,0 +1,102 @@
+# =============================================================================
+# Dockerfile.base - the shared base image every poker agent is built on.
+#
+# The organizers build this ONCE and push it to the private Artifact Registry:
+#     docker build -f Dockerfile.base -t us-south1-docker.pkg.dev/<project>/poker-agents/agent_base:v1 .
+#     docker push  us-south1-docker.pkg.dev/<project>/poker-agents/agent_base:v1
+#
+# Participants get this exact file in the template and build it locally as
+# "poker-agent-base:local" (tools/check_build.sh does this for them). If a bot
+# builds and passes the smoke test on the local copy, it builds on ours.
+#
+# What is inside:
+#   * Python 3.12 (slim Debian), with OS security updates applied
+#   * the server stack: FastAPI + uvicorn, LOCKED to the versions below
+#   * numpy and PyTorch (CPU-only edition, no GPU libraries)
+#   * a non-root user "bot" that agents run as
+#   * settings that stop ML libraries from starting one thread per CPU core
+#
+# Pin the Python base by digest before building the real image, e.g.
+#     docker build --build-arg PYTHON_IMAGE=python:3.12-slim@sha256:<digest> ...
+# (find the digest with: docker pull python:3.12-slim && docker images --digests)
+# =============================================================================
+
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE}
+
+# Versions of the server stack. These must match requirements.txt in the
+# participant template. They are written to /opt/poker/constraints.txt below,
+# so a participant's requirements.txt can't swap them for other versions.
+ARG FASTAPI_VERSION=0.156.1
+ARG UVICORN_VERSION=0.54.0
+
+# PyTorch to pre-install. "torch" means the newest CPU release at build time.
+# Pin it for a reproducible base, e.g. --build-arg TORCH_SPEC="torch==2.9.1".
+ARG TORCH_SPEC=torch
+
+# --- Environment -------------------------------------------------------------
+ENV \
+    # Don't write .pyc files at runtime (the app folder is read-only anyway).
+    PYTHONDONTWRITEBYTECODE=1 \
+    # Print logs immediately instead of buffering them.
+    PYTHONUNBUFFERED=1 \
+    # Quieter, non-interactive pip.
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    # The only writable place at match time is /tmp, so libraries that save
+    # caches or config files into $HOME (matplotlib, torch hub, ...) use /tmp.
+    HOME=/tmp \
+    # ML libraries normally start one worker thread per CPU core. The VM has
+    # 96 cores shared by many bots at once, so that would be far slower.
+    # One thread each is the fair default; a bot may raise these itself.
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    TF_NUM_INTRAOP_THREADS=1 \
+    TF_NUM_INTEROP_THREADS=1 \
+    TF_CPP_MIN_LOG_LEVEL=2 \
+    # agent.py reads this; the tournament overrides it per container.
+    PORT=5008
+
+# --- OS packages: apply security updates, keep nothing extra -----------------
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- The server stack, then lock its exact versions -------------------------
+# We install FastAPI + uvicorn FIRST and record every package version pip
+# picked (fastapi, uvicorn, starlette, pydantic, ...). Agent builds install
+# with "-c /opt/poker/constraints.txt", so those versions can't change.
+RUN mkdir -p /opt/poker \
+ && pip install --no-cache-dir "fastapi==${FASTAPI_VERSION}" "uvicorn==${UVICORN_VERSION}" \
+ && pip freeze > /opt/poker/constraints.txt
+
+# --- numpy and CPU-only PyTorch ----------------------------------------------
+# PyTorch's default Linux download bundles NVIDIA GPU libraries (several GB)
+# that are useless here: the tournament VM has no GPU. PyTorch hosts a
+# separate CPU-only edition at the index below, which is much smaller.
+# These are NOT locked: a participant may ask for a different version.
+RUN pip install --no-cache-dir numpy \
+ && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu ${TORCH_SPEC} \
+ && pip freeze > /opt/poker/base-packages.txt
+
+# --- Non-root user -------------------------------------------------------------
+# A fixed numeric ID so Kubernetes can check "runAsNonRoot" and match file
+# ownership. No home directory and no login shell.
+RUN groupadd --gid 10001 bot \
+ && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp --shell /usr/sbin/nologin bot
+
+# --- Hardening -----------------------------------------------------------------
+# Remove the "setuid/setgid" permission bit from every program. Those bits
+# let a normal user run a program as root (e.g. su, passwd); bots never need
+# that, and removing them closes a common way to gain privileges.
+RUN find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+
+# Agents live in /app. Everything outside /tmp is read-only for the "bot" user.
+WORKDIR /app
+RUN chmod 0755 /app /opt/poker && chmod 0644 /opt/poker/*.txt
+
+USER 10001:10001
+CMD ["python", "agent.py"]
