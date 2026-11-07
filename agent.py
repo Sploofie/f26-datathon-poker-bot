@@ -5,24 +5,20 @@ Run it:
     python agent.py                  # listens on port 5008
     PORT=5010 python agent.py        # or pick a port
 
-Play a match against a baseline (three windows):
-    python agent.py                                 # your bot on port 5008
-    python baseline-bots/baseline_random.py         # opponent on port 5009
-    python judge_engine.py                          # judge: both halves (uses those two ports)
-
-Check that the tournament can run it:
-    python -m pytest -q              # tests in test_agent.py
-    ./tools/check_build.sh           # builds and smoke-tests it like the tournament
-
-TODO:
-    1. Assign your agent a unique PARTICIPANT and AGENT_NAME below.
-    2. Implement the three functions between "YOUR CODE HERE" and "END OF YOUR CODE".
-
-Everything under "SERVER PLUMBING" talks to the judge. You normally never
-need to change it, and if you break it the judge can't talk to your bot.
+Strategy summary:
+  * Monte Carlo equity (vs a random opponent hand) using omaha_score, with a
+    strict per-decision time budget so the 8 s half-match time bank is never
+    exhausted.
+  * Equity is discounted when facing bets (opponent's betting range is
+    stronger than random), adjusted by a simple opponent-aggression estimate.
+  * Compare equity with pot odds to fold / call / raise (half pot or pot).
+  * Everything is wrapped in try/except with a legal-action fallback, because
+    5 errors in a half forfeits the match.
 """
 
 import os
+import random
+import time
 import traceback
 
 import uvicorn
@@ -34,77 +30,229 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 
 # Build omaha_score's lookup table now, while the server starts, instead of
 # during your first decision (where it would eat into your time bank).
-# Do any other slow setup (loading a model, ...) here too: the server must
-# answer within 15 seconds of starting.
 warmup()
 
 # rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
+PARTICIPANT = "schlorps"
+AGENT_NAME = "schlorps"
 
 
 # ===== YOUR CODE HERE =====
 
+ALL_CARDS = list(range(36))
+RNG = random.Random()
+
+# Time management (seconds). The bank is 8 s per half; we aim to spend only
+# TARGET_COMPUTE of it on our own computation, leaving margin for request
+# overhead (JSON parsing, HTTP) which is also timed by the judge.
+TARGET_COMPUTE = 3.5
+MAX_PER_DECISION = 0.006
+MIN_PER_DECISION = 0.0004
+MAX_ITERS = 400
+OPP_HANDS_PER_BOARD = 3          # opponent hands sampled per board run-out
+
+
 def new_half(config: AgentConfig, memory: dict) -> None:
-    """Called at the start of each half-match (1000 hands).
-
-    `memory` is a fresh, empty dict every half. Store anything you want to
-    remember between hands in it, e.g. memory["opp_raises"] = 0.
-    `config` holds the match settings (starting_stack, big_blind, ...).
-
-    In the tournament, each half runs in a brand-new copy of your server,
-    so nothing you learn in one half carries over to the other half.
-    """
+    """Called at the start of each half-match (1000 hands)."""
     memory["hands_played"] = 0
+    memory["time_used"] = 0.0
+    memory["decisions"] = 0
+    memory["opp_actions"] = 0
+    memory["opp_raises"] = 0
+    memory["hist_hand"] = -1
+    memory["hist_seen"] = 0
 
 
-def choose_action(obs: Observation, memory: dict) -> Action:
-    """Called every time it is your turn. Return one of obs.legal_actions.
+# ---------- helpers ----------
 
-    What you can see in obs:
-        hand_index          which hand of the half this is (0, 1, 2, ...)
-        street              Street.PREFLOP, Street.FLOP, Street.TURN or Street.RIVER
-        hole_cards          your 5 cards as ints, sorted ascending (0-35)
-        board               board (community) cards seen so far (0, 3, 4 or 5 ints)
-        pot                 total chips both players put in this hand
-        to_call             chips you must add to match the opponent
-        my_bet, opp_bet     chips you,opponent put in on THIS street
-        my_stack, opp_stack chips each player still has behind
-        is_button           True if you are the button (small blind)
-        legal_actions       the Actions you may return right now
-        raise_to            {RAISE_HALF: total, RAISE_POT: total} for legal raises
-        min_raise_to        smallest normal raise total (all-ins may be lower)
-        raises_this_street  raises so far this street (max 4)
-        action_history      this hand's actions so far; each has
-                            street, is_me, action, amount, street_total
-        big_blind           size of the big blind in chips
+def _name(a) -> str:
+    return str(getattr(a, "name", a)).upper()
 
-    Actions: Action.FOLD, Action.CHECK_CALL, Action.RAISE_HALF, Action.RAISE_POT
-    Cards are ints: card_rank(c) is 0 (six) .. 8 (ace), card_suit(c) is 0..3,
-    and cards_to_str(obs.hole_cards) prints them like "6h 7c 9s Kd Ah".
-    Once all 5 board cards are out, omaha_score(obs.hole_cards, obs.board)
-    scores your hand (higher is better).
-    """
 
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
+def _update_opp_stats(obs: Observation, memory: dict) -> None:
+    """Count opponent actions/raises from this hand's action history (once each)."""
+    if memory.get("hist_hand") != obs.hand_index:
+        memory["hist_hand"] = obs.hand_index
+        memory["hist_seen"] = 0
+    hist = obs.action_history or []
+    seen = memory.get("hist_seen", 0)
+    for h in hist[seen:]:
+        if not getattr(h, "is_me", False):
+            memory["opp_actions"] = memory.get("opp_actions", 0) + 1
+            if "RAISE" in _name(getattr(h, "action", "")):
+                memory["opp_raises"] = memory.get("opp_raises", 0) + 1
+    memory["hist_seen"] = len(hist)
+
+
+def _aggression(memory: dict) -> float:
+    """Smoothed opponent raise frequency (prior ~0.33)."""
+    return (memory.get("opp_raises", 0) + 2.0) / (memory.get("opp_actions", 0) + 6.0)
+
+
+def _budget(obs: Observation, memory: dict) -> float:
+    """Seconds we may spend on this decision."""
+    used = memory.get("time_used", 0.0)
+    remaining_hands = max(1, 1000 - obs.hand_index)
+    est_decisions = remaining_hands * 3.0
+    b = (TARGET_COMPUTE - used) / est_decisions
+    if TARGET_COMPUTE - used <= 0:
+        return 0.0
+    return max(0.0, min(MAX_PER_DECISION, b))
+
+
+def _equity(obs: Observation, budget: float) -> float:
+    """Monte Carlo equity vs a uniformly random opponent hand, within `budget` seconds."""
+    hole = list(obs.hole_cards)
+    board = list(obs.board)
+    dead = set(hole) | set(board)
+    unknown = [c for c in ALL_CARDS if c not in dead]
+    need = 5 - len(board)
+    k = OPP_HANDS_PER_BOARD
+    draw = need + 5 * k
+    if draw > len(unknown):
+        k = max(1, (len(unknown) - need) // 5)
+        draw = need + 5 * k
+
+    t_end = time.perf_counter() + budget
+    wins = 0.0
+    total = 0
+    it = 0
+    sample = RNG.sample
+    while it < MAX_ITERS:
+        it += 1
+        cards = sample(unknown, draw)
+        full_board = board + cards[:need] if need else board
+        mine = omaha_score(hole, full_board)
+        pos = need
+        for _ in range(k):
+            opp = cards[pos:pos + 5]
+            pos += 5
+            theirs = omaha_score(opp, full_board)
+            if mine > theirs:
+                wins += 1.0
+            elif mine == theirs:
+                wins += 0.5
+            total += 1
+        if (it & 3) == 0 and time.perf_counter() >= t_end:
+            break
+        if it >= 6 and time.perf_counter() >= t_end + budget:  # hard stop safety
+            break
+    if total == 0:
+        return 0.5
+    return wins / total
+
+
+def _cheap_heuristic(obs: Observation) -> Action:
+    """Used when out of time budget or on any failure: very cheap and safe."""
     if obs.to_call == 0:
+        return Action.CHECK_CALL
+    if obs.to_call <= obs.big_blind:
+        return Action.CHECK_CALL
+    if obs.pot > 0 and obs.to_call <= 0.2 * obs.pot:
         return Action.CHECK_CALL
     return Action.FOLD
 
 
+def _legalize(a, obs: Observation) -> Action:
+    """Guarantee we return something legal."""
+    la = list(obs.legal_actions)
+    if a in la:
+        # never fold when checking is free
+        if a == Action.FOLD and obs.to_call == 0 and Action.CHECK_CALL in la:
+            return Action.CHECK_CALL
+        return a
+    if Action.CHECK_CALL in la:
+        return Action.CHECK_CALL
+    return la[0]
+
+
+def _decide(obs: Observation, memory: dict) -> Action:
+    la = obs.legal_actions
+    can_pot = Action.RAISE_POT in la
+    can_half = Action.RAISE_HALF in la
+    can_raise = can_pot or can_half
+
+    _update_opp_stats(obs, memory)
+
+    budget = _budget(obs, memory)
+    if budget < MIN_PER_DECISION:
+        return _cheap_heuristic(obs)
+
+    eq = _equity(obs, budget)
+    agg = _aggression(memory)
+    to_call = obs.to_call
+    pot = obs.pot
+
+    # ----- facing a bet / raise (or preflop blind to complete) -----
+    if to_call > 0:
+        pot_before = max(1, pot - to_call)
+        size = min(1.0, to_call / pot_before)
+        discount = 0.03 + 0.12 * size           # opp range is stronger than random
+        if agg > 0.5:
+            discount *= 0.5                      # very aggressive opp bluffs more
+        elif agg < 0.2:
+            discount *= 1.3                      # passive opp: bets mean strength
+        if obs.street == Street.PREFLOP and to_call <= obs.big_blind:
+            discount = 0.0                       # just completing / calling a blind
+        e = eq - discount
+
+        need = to_call / float(pot + to_call)    # break-even equity
+        if e < need + 0.02:
+            return Action.FOLD
+
+        heavy = obs.raises_this_street >= 3
+        if can_raise and not heavy:
+            if e >= 0.72 and can_pot:
+                return Action.RAISE_POT
+            if e >= 0.62:
+                if can_half:
+                    return Action.RAISE_HALF
+                return Action.RAISE_POT
+        elif can_raise and heavy and e >= 0.82:
+            return Action.RAISE_POT if can_pot else Action.RAISE_HALF
+        return Action.CHECK_CALL
+
+    # ----- nothing to call: bet or check -----
+    e = eq
+    if can_raise:
+        if e >= 0.66 and can_pot:
+            return Action.RAISE_POT
+        if e >= 0.55:
+            return Action.RAISE_HALF if can_half else Action.RAISE_POT
+        # light bluffing/semi-bluffing to stay unexploitable
+        if 0.38 <= e < 0.5 and RNG.random() < 0.08:
+            return Action.RAISE_HALF if can_half else Action.RAISE_POT
+    return Action.CHECK_CALL
+
+
+def choose_action(obs: Observation, memory: dict) -> Action:
+    """Called every time it is your turn. Return one of obs.legal_actions."""
+    t0 = time.perf_counter()
+    try:
+        action = _decide(obs, memory)
+    except Exception:
+        try:
+            action = _cheap_heuristic(obs)
+        except Exception:
+            action = Action.CHECK_CALL
+    try:
+        memory["time_used"] = memory.get("time_used", 0.0) + (time.perf_counter() - t0)
+        memory["decisions"] = memory.get("decisions", 0) + 1
+    except Exception:
+        pass
+    try:
+        return _legalize(action, obs)
+    except Exception:
+        return Action.CHECK_CALL
+
+
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """Called once for every finished hand. Optional: learn from what happened.
-
-    To save time, the judge sends finished hands along with your next
-    decision request, so this always runs BEFORE choose_action() sees the
-    next hand. (The last hands of a half arrive at the end of the half.)
-
-    result has: hand_index, my_net (chips won or lost), pot,
-    went_to_showdown, board (cards revealed), opp_hole (opponent's cards,
-    only after a showdown, else None), winner ('me', 'opp' or 'split').
-    """
-    memory["hands_played"] += 1
+    """Called once for every finished hand. Kept trivially safe: an exception
+    here counts as an error toward the 5-error forfeit."""
+    try:
+        memory["hands_played"] = memory.get("hands_played", 0) + 1
+    except Exception:
+        pass
 
 # ===== END OF YOUR CODE =====
 
